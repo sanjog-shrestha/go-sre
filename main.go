@@ -7,65 +7,45 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
-	"sync"
-	"fmt"
-	"strings"
 	"sync/atomic"	
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp")
+
+var (
+	httpRequestsTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "http_requests_total",
+			Help: "The total number of HTTP requests processed.",
+		},
+		[]string{"path", "method", "status"},
+	)
+
+	httpRequestDuration = promauto.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "http_request_duration_seconds",
+			Help:    "HTTP request latency in seconds.",
+			Buckets: prometheus.DefBuckets,
+		},
+		[]string{"path", "method"},
+	)
 )
-
-type metrics struct {
-	mu sync.Mutex
-	counters map[string]int64
-	startTime time.Time
-}
-
-func newMetrics() *metrics {
-	return &metrics{
-		counters: make(map[string]int64),
-		startTime: time.Now(),
-	}
-}
-
-func (m *metrics) inc(path,method string, status int) {	
-	key := fmt.Sprintf("%s|%s|%d", path, method, status)
-	m.mu.Lock()
-	m.counters[key]++
-	m.mu.Unlock()
-}
-
-func(m *metrics) render() string {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	var b strings.Builder
-	b.WriteString("# HELP http_requests_total The total number of HTTP requests.\n")
-	b.WriteString("# TYPE http_requests_total counter\n")
-	for key, count := range m.counters {
-		parts := strings.SplitN(key, "|", 3)
-		path,method, status := parts[0], parts[1], parts[2]
-		fmt.Fprintf(&b, "http_requests_total{path=\"%q\",method=\"%q\",status=\"%q\"} %d\n", path, method, status, count)
-	}
-
-	b.WriteString(fmt.Sprintf("# HELP process_start_time_seconds Time since process start.\n"))
-	b.WriteString(fmt.Sprintf("# TYPE process_uptime_seconds gauge\n"))
-	fmt.Fprintf(&b, "process_uptime_seconds %f\n", time.Since(m.startTime).Seconds())
-	
-	return b.String()
-}
 
 type statusRecorder struct {
 	http.ResponseWriter
 	status int
 }
 
-func (r *statusRecorder) WriteHeader(code int) {
+func(r *statusRecorder) WriteHeader(code int) {
 	r.status = code
 	r.ResponseWriter.WriteHeader(code)
 }
 
-func instrument(m *metrics, logger *slog.Logger, next http.HandlerFunc) http.HandlerFunc {
+func instrument(logger *slog.Logger, path string, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
@@ -73,7 +53,11 @@ func instrument(m *metrics, logger *slog.Logger, next http.HandlerFunc) http.Han
 		next(rec, r)
 
 		duration := time.Since(start)
-		m.inc(r.URL.Path, r.Method, rec.status)
+		status := strconv.Itoa(rec.status)
+
+		httpRequestsTotal.WithLabelValues(r.URL.Path, r.Method, status).Inc()
+		httpRequestDuration.WithLabelValues(r.URL.Path, r.Method).Observe(duration.Seconds())
+
 		logger.Info("request handled", "path", r.URL.Path, "method", r.Method, "status", rec.status, "duration_ms", duration.Milliseconds(),)
 	}
 }
@@ -99,17 +83,8 @@ func readyzHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("ready\n"))
 }
 
-func metricsHandler(m *metrics) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/plain,; version=0.0.4")
-		w.Write([]byte(m.render()))
-	}
-}
-
-
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-	m := newMetrics()
 
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -123,11 +98,11 @@ func main() {
 	}()
 
 	mux := http.NewServeMux()
-	mux.Handle("/", instrument(m,logger, rootHandler))
-	mux.Handle("/healthz", instrument(m,logger, readyzHandler))
-	mux.Handle("/livez", instrument(m,logger, livezHandler))
-	mux.Handle("/readyz", instrument(m,logger, readyzHandler))
-	mux.Handle("/metrics", metricsHandler(m))
+	mux.Handle("/", instrument(logger, "/", rootHandler))
+	mux.Handle("/healthz", instrument(logger, "/healthz", readyzHandler))
+	mux.Handle("/livez", instrument(logger, "/livez", livezHandler))
+	mux.Handle("/readyz", instrument(logger, "/readyz", readyzHandler))
+	mux.Handle("/metrics", promhttp.Handler())
 
 	srv := &http.Server{
 		Addr:         ":" + port,

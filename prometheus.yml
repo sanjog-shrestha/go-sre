@@ -1,0 +1,7 @@
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  - job_name: 'sre-go-scratch'
+    static_configs:
+      - targets: ['sre-app:8080']

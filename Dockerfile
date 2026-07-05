@@ -1,8 +1,9 @@
 # ---- Stage 1: Build ----
-FROM golang:1.22-alpine AS builder  
+FROM golang:1.23-alpine AS builder  
 WORKDIR /app
 COPY go.mod ./
 COPY main.go ./
+RUN go mod tidy 
 RUN CGO_ENABLED=0 GOOS=linux go build -o server main.go
 
 # ---- Stage 2: Run ----
