@@ -1,0 +1,36 @@
+groups:
+  - name: sre-go-scratch-slo
+    rules:
+      - alert: HighErrorRate
+        expr: |
+          (
+            sum(rate(http_requests_total{status=~"5.."}[5m]))
+            /
+            sum(rate(http_requests_total[5m]))
+          ) > 0.01
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "Error rate above 1% SLO threshold"
+          description: "More than 1% of requests have returned a 5xx status over the last 5 minutes."
+
+      - alert: HighLatencyP95
+        expr: |
+          histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[5m])) by (le))
+          > 0.2
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "p95 latency above 200ms SLO threshold"
+          description: "The 95th percentile of request latency has exceeded 200ms for 5 minutes."
+
+      - alert: ServiceDown
+        expr: up{job="sre-go-scratch"} == 0
+        for: 1m
+        labels:
+          severity: page
+        annotations:
+          summary: "sre-go-scratch is unreachable"
+          description: "Prometheus has been unable to scrape sre-go-scratch for over 1 minute."
