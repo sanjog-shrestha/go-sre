@@ -8,19 +8,20 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"sync/atomic"
 	"syscall"
 	"time"
-	"sync/atomic"	
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
-	"github.com/prometheus/client_golang/prometheus/promhttp")
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+)
 
 var (
 	httpRequestsTotal = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "http_requests_total",
-			Help: "The total number of HTTP requests processed.",
+			Help: "Total number of HTTP requests processed",
 		},
 		[]string{"path", "method", "status"},
 	)
@@ -28,7 +29,7 @@ var (
 	httpRequestDuration = promauto.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Name:    "http_request_duration_seconds",
-			Help:    "HTTP request latency in seconds.",
+			Help:    "HTTP request latency in seconds",
 			Buckets: prometheus.DefBuckets,
 		},
 		[]string{"path", "method"},
@@ -40,7 +41,7 @@ type statusRecorder struct {
 	status int
 }
 
-func(r *statusRecorder) WriteHeader(code int) {
+func (r *statusRecorder) WriteHeader(code int) {
 	r.status = code
 	r.ResponseWriter.WriteHeader(code)
 }
@@ -55,11 +56,36 @@ func instrument(logger *slog.Logger, path string, next http.HandlerFunc) http.Ha
 		duration := time.Since(start)
 		status := strconv.Itoa(rec.status)
 
-		httpRequestsTotal.WithLabelValues(r.URL.Path, r.Method, status).Inc()
-		httpRequestDuration.WithLabelValues(r.URL.Path, r.Method).Observe(duration.Seconds())
+		httpRequestsTotal.WithLabelValues(path, r.Method, status).Inc()
+		httpRequestDuration.WithLabelValues(path, r.Method).Observe(duration.Seconds())
 
-		logger.Info("request handled", "path", r.URL.Path, "method", r.Method, "status", rec.status, "duration_ms", duration.Milliseconds(),)
+		logger.Info("request handled",
+			"path", path,
+			"method", r.Method,
+			"status", rec.status,
+			"duration_ms", duration.Milliseconds(),
+		)
 	}
+}
+
+func recoverMiddleware(logger *slog.Logger, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if rec := recover(); rec != nil {
+				logger.Error("panic recovered",
+					"error", rec,
+					"path", r.URL.Path,
+				)
+				w.WriteHeader(http.StatusInternalServerError)
+				w.Write([]byte("internal server error\n"))
+			}
+		}()
+		next(w, r)
+	}
+}
+
+func withMiddleware(logger *slog.Logger, path string, h http.HandlerFunc) http.HandlerFunc {
+	return instrument(logger, path, recoverMiddleware(logger, h))
 }
 
 var ready atomic.Bool
@@ -83,6 +109,19 @@ func readyzHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("ready\n"))
 }
 
+func simulateErrorHandler(w http.ResponseWriter, r *http.Request) {
+	http.Error(w, "simulated internal error\n", http.StatusInternalServerError)
+}
+
+func simulateSlowHandler(w http.ResponseWriter, r *http.Request) {
+	time.Sleep(300 * time.Millisecond)
+	w.Write([]byte("slow response completed\n"))
+}
+
+func simulatePanicHandler(w http.ResponseWriter, r *http.Request) {
+	panic("simulated panic for testing recovery middleware")
+}
+
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 
@@ -92,7 +131,7 @@ func main() {
 	}
 
 	go func() {
-	  	time.Sleep(5 * time.Second)
+		time.Sleep(5 * time.Second)
 		ready.Store(true)
 		logger.Info("service is now ready")
 	}()
@@ -102,6 +141,9 @@ func main() {
 	mux.Handle("/healthz", instrument(logger, "/healthz", readyzHandler))
 	mux.Handle("/livez", instrument(logger, "/livez", livezHandler))
 	mux.Handle("/readyz", instrument(logger, "/readyz", readyzHandler))
+	mux.Handle("/simulate-error", withMiddleware(logger, "/simulate-error", simulateErrorHandler))
+	mux.Handle("/simulate-slow", withMiddleware(logger, "/simulate-slow", simulateSlowHandler))
+	mux.Handle("/simulate-panic", withMiddleware(logger, "/simulate-panic", simulatePanicHandler))
 	mux.Handle("/metrics", promhttp.Handler())
 
 	srv := &http.Server{
